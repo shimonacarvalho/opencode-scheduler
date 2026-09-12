@@ -1923,7 +1923,7 @@ function runJobNow(job) {
   logStream.write(`
 === Manual run ${startedAt} ===
 `);
-  const { command, args } = buildOpencodeArgs(job);
+  const { command, args } = job.invocation ?? buildOpencodeArgs(job);
   let child;
   try {
     child = spawn(command, args, {
@@ -2658,6 +2658,7 @@ ${content.trim()}
               return {};
             }
           })();
+          const hasOverride = args.prompt !== void 0 || args.command !== void 0 || args.arguments !== void 0 || args.files !== void 0 || args.agent !== void 0 || args.model !== void 0 || args.variant !== void 0 || args.title !== void 0 || args.share !== void 0 || args.continue !== void 0 || args.session !== void 0 || args.runFormat !== void 0 || args.port !== void 0 || args.attachUrl !== void 0;
           const overrideCandidate = {
             ...baseRun,
             prompt: args.prompt !== void 0 ? args.prompt : baseRun.prompt,
@@ -2687,6 +2688,14 @@ ${content.trim()}
             ...job,
             run: runOverride
           };
+          if (hasOverride) {
+            try {
+              runJob.invocation = buildOpencodeArgs(runJob);
+            } catch (error) {
+              const msg = error instanceof Error ? error.message : String(error);
+              return errorResult(format, `Failed to build invocation: ${msg}`);
+            }
+          }
           let runResult;
           try {
             runResult = runJobNow(runJob);

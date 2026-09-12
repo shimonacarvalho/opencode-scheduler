@@ -2489,7 +2489,10 @@ function runJobNow(job: Job): { startedAt: string; logPath: string; pid?: number
 
   logStream.write(`\n=== Manual run ${startedAt} ===\n`)
 
-  const { command, args } = buildOpencodeArgs(job)
+  // Prefer the stored invocation snapshot (what the perl supervisor runs for
+  // scheduled ticks) so manual and scheduled runs can't drift. run_job rebuilds
+  // and replaces job.invocation only when a one-off override is supplied.
+  const { command, args } = job.invocation ?? buildOpencodeArgs(job)
   let child: ChildProcess
   try {
     child = spawn(command, args, {
@@ -3423,6 +3426,22 @@ Commands:
             }
           })()
 
+          const hasOverride =
+            args.prompt !== undefined ||
+            args.command !== undefined ||
+            args.arguments !== undefined ||
+            args.files !== undefined ||
+            args.agent !== undefined ||
+            args.model !== undefined ||
+            args.variant !== undefined ||
+            args.title !== undefined ||
+            args.share !== undefined ||
+            args.continue !== undefined ||
+            args.session !== undefined ||
+            args.runFormat !== undefined ||
+            args.port !== undefined ||
+            args.attachUrl !== undefined
+
           const overrideCandidate: JobRunSpec = {
             ...baseRun,
             prompt: args.prompt !== undefined ? args.prompt : baseRun.prompt,
@@ -3453,6 +3472,18 @@ Commands:
           const runJob: Job = {
             ...job,
             run: runOverride,
+          }
+
+          // Only rebuild the invocation when the caller actually overrode the
+          // run spec; otherwise keep the stored snapshot so this matches the
+          // scheduled path byte-for-byte. runJobNow prefers runJob.invocation.
+          if (hasOverride) {
+            try {
+              runJob.invocation = buildOpencodeArgs(runJob)
+            } catch (error) {
+              const msg = error instanceof Error ? error.message : String(error)
+              return errorResult(format, `Failed to build invocation: ${msg}`)
+            }
           }
 
           let runResult
