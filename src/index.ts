@@ -828,15 +828,32 @@ function findOpencode(): string {
 
 // Get PATH that includes common locations for node/npx
 function getEnhancedPath(): string {
-  const paths = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-  ]
-  return paths.join(":")
+  // The OS scheduler (launchd/systemd/cron) starts jobs with a minimal PATH,
+  // so the fixed defaults below are not enough: tools installed under a Node
+  // version manager (nvm/fnm/volta/asdf) or other user-managed bin dirs are
+  // invisible, and any MCP server opencode spawns as `["tool", ...]` fails to
+  // resolve. We therefore prepend the PATH of the process that is scheduling
+  // the job (opencode running in the user's shell, where those managers are
+  // active) plus the current runtime's own bin dir, ahead of the safe system
+  // defaults. This is a snapshot taken at schedule/update time.
+  const defaults = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+  const entries: string[] = []
+  const add = (value?: string | null) => {
+    if (!value) return
+    for (const segment of value.split(":")) {
+      const trimmed = segment.trim()
+      if (trimmed && !entries.includes(trimmed)) entries.push(trimmed)
+    }
+  }
+  // 1) the scheduling shell's PATH (captures nvm/fnm/volta/asdf, etc.)
+  add(process.env.PATH)
+  // 2) the directory of the currently executing runtime binary
+  try {
+    add(dirname(process.execPath))
+  } catch {}
+  // 3) safe system defaults last, so they are always present as a fallback
+  for (const dir of defaults) add(dir)
+  return entries.join(":")
 }
 
 function splitCronExpression(cron: string): [string, string, string, string, string] {

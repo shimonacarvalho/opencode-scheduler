@@ -646,15 +646,22 @@ function findOpencode() {
   return "opencode";
 }
 function getEnhancedPath() {
-  const paths = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin"
-  ];
-  return paths.join(":");
+  const defaults = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+  const entries = [];
+  const add = (value) => {
+    if (!value) return;
+    for (const segment of value.split(":")) {
+      const trimmed = segment.trim();
+      if (trimmed && !entries.includes(trimmed)) entries.push(trimmed);
+    }
+  };
+  add(process.env.PATH);
+  try {
+    add(dirname(process.execPath));
+  } catch {
+  }
+  for (const dir of defaults) add(dir);
+  return entries.join(":");
 }
 function splitCronExpression(cron) {
   const parts = cron.trim().split(/\s+/);
