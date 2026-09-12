@@ -13,7 +13,7 @@
  */
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
 import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
@@ -27,6 +27,16 @@ const SCHEDULER_DIR = join(OPENCODE_CONFIG, "scheduler")
 const SCOPES_DIR = join(SCHEDULER_DIR, "scopes")
 const SUPERVISOR_PATH = join(SCHEDULER_DIR, "supervisor.pl")
 const SCHEDULER_CONFIG = join(OPENCODE_CONFIG, "opencode-scheduler.json")
+
+// Worktree isolation (fork addition).
+// Each isolated run gets its own git worktree under WORKTREES_DIR/<scopeId>/,
+// created by WORKTREE_WRAPPER_PATH and left in place for later review; a
+// separate reap (cleanup_worktrees tool) removes stale ones. Metadata for each
+// worktree is written as a sidecar <name>.meta.json next to the worktree dir so
+// the worktree itself stays git-clean.
+const WORKTREES_DIR = join(SCHEDULER_DIR, "worktrees")
+const WORKTREE_WRAPPER_PATH = join(SCHEDULER_DIR, "worktree-run.sh")
+const DEFAULT_WORKTREE_KEEP_HOURS = 24
 
 // Platform detection
 const IS_MAC = platform() === "darwin"
@@ -355,6 +365,157 @@ function ensureSupervisorScript(): void {
   writeFileSync(SUPERVISOR_PATH, SUPERVISOR_SCRIPT)
 }
 
+// === WORKTREE ORCHESTRATION (fork addition) ===
+//
+// The wrapper is invoked *in place of* `opencode run ...` when a job has
+// worktree isolation enabled. It runs from the job's workdir (the perl
+// supervisor chdirs there for scheduled runs; runJobNow spawns with that cwd),
+// creates a fresh git worktree + branch off a base ref, records sidecar
+// metadata, then execs the real command inside the worktree. Cleanup is
+// deliberately deferred to the cleanup_worktrees tool so runs stay reviewable.
+const WORKTREE_WRAPPER_SCRIPT = `#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage: worktree-run.sh <scopeId> <slug> <baseRef> <wtBase> -- <command> [args...]
+SCOPE_ID="\${1:-}"
+SLUG="\${2:-}"
+BASE_REF="\${3:-HEAD}"
+WT_BASE="\${4:-}"
+shift 4 || true
+if [ "\${1:-}" = "--" ]; then shift; fi
+
+if [ -z "\$SCOPE_ID" ] || [ -z "\$SLUG" ] || [ -z "\$WT_BASE" ] || [ "\$#" -eq 0 ]; then
+  echo "worktree-run.sh: missing required arguments" >&2
+  exit 2
+fi
+
+REPO_DIR="\$PWD"
+RUN_ID="\${OPENCODE_SCHEDULER_RUN_ID:-\$(date +%s)-\$\$}"
+GIT_ROOT="\$(git -C "\$REPO_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "\$GIT_ROOT" ]; then
+  echo "worktree-run.sh: \$REPO_DIR is not inside a git repository; running without isolation" >&2
+  exec "\$@"
+fi
+
+mkdir -p "\$WT_BASE"
+WT_DIR="\$WT_BASE/\${SLUG}__\${RUN_ID}"
+BRANCH="sched-\${SLUG}-\${RUN_ID}"
+META="\$WT_BASE/\${SLUG}__\${RUN_ID}.meta.json"
+CREATED_AT="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+echo "=== [worktree] add \$WT_DIR (branch \$BRANCH from \$BASE_REF) ==="
+git -C "\$GIT_ROOT" worktree add -b "\$BRANCH" "\$WT_DIR" "\$BASE_REF"
+
+cat > "\$META" <<META_EOF
+{"scopeId":"\$SCOPE_ID","slug":"\$SLUG","runId":"\$RUN_ID","branch":"\$BRANCH","gitRoot":"\$GIT_ROOT","worktree":"\$WT_DIR","baseRef":"\$BASE_REF","createdAt":"\$CREATED_AT"}
+META_EOF
+
+cd "\$WT_DIR"
+echo "=== [worktree] running in \$WT_DIR ==="
+exec "\$@"
+`
+
+function ensureWorktreeWrapper(): void {
+  ensureDir(SCHEDULER_DIR)
+  writeFileSync(WORKTREE_WRAPPER_PATH, WORKTREE_WRAPPER_SCRIPT, { mode: 0o755 })
+}
+
+function worktreeBaseDir(scopeId: string): string {
+  return join(WORKTREES_DIR, scopeId)
+}
+
+interface WorktreeMeta {
+  scopeId: string
+  slug: string
+  runId: string
+  branch: string
+  gitRoot: string
+  worktree: string
+  baseRef: string
+  createdAt: string
+  metaPath: string
+  exists: boolean
+  ageHours: number
+}
+
+function listWorktreeMetas(filter?: { scopeId?: string; slug?: string }): WorktreeMeta[] {
+  const results: WorktreeMeta[] = []
+  if (!existsSync(WORKTREES_DIR)) return results
+  const now = Date.now()
+  const scopeDirs = filter?.scopeId ? [filter.scopeId] : readdirSync(WORKTREES_DIR)
+  for (const scopeId of scopeDirs) {
+    const base = worktreeBaseDir(scopeId)
+    if (!existsSync(base)) continue
+    let entries: string[]
+    try {
+      entries = readdirSync(base)
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith(".meta.json")) continue
+      const metaPath = join(base, entry)
+      let meta: Partial<WorktreeMeta>
+      try {
+        meta = JSON.parse(readFileSync(metaPath, "utf-8")) as Partial<WorktreeMeta>
+      } catch {
+        continue
+      }
+      if (!meta.worktree || !meta.slug) continue
+      if (filter?.slug && meta.slug !== filter.slug) continue
+      const createdMs = meta.createdAt ? Date.parse(meta.createdAt) : NaN
+      const ageHours = Number.isFinite(createdMs) ? (now - createdMs) / 3_600_000 : Infinity
+      results.push({
+        scopeId: meta.scopeId ?? scopeId,
+        slug: meta.slug,
+        runId: meta.runId ?? "",
+        branch: meta.branch ?? "",
+        gitRoot: meta.gitRoot ?? "",
+        worktree: meta.worktree,
+        baseRef: meta.baseRef ?? "HEAD",
+        createdAt: meta.createdAt ?? "",
+        metaPath,
+        exists: existsSync(meta.worktree),
+        ageHours,
+      })
+    }
+  }
+  return results.sort((a, b) => b.ageHours - a.ageHours)
+}
+
+function removeWorktree(meta: WorktreeMeta, deleteBranch: boolean): { ok: boolean; error?: string } {
+  try {
+    if (meta.gitRoot && existsSync(meta.gitRoot)) {
+      if (existsSync(meta.worktree)) {
+        try {
+          execFileSync("git", ["-C", meta.gitRoot, "worktree", "remove", "--force", meta.worktree], {
+            stdio: "ignore",
+          })
+        } catch {
+          // Fall back to a plain directory removal + prune below.
+          rmSync(meta.worktree, { recursive: true, force: true })
+        }
+      }
+      try {
+        execFileSync("git", ["-C", meta.gitRoot, "worktree", "prune"], { stdio: "ignore" })
+      } catch {}
+      if (deleteBranch && meta.branch) {
+        try {
+          execFileSync("git", ["-C", meta.gitRoot, "branch", "-D", meta.branch], { stdio: "ignore" })
+        } catch {}
+      }
+    } else if (existsSync(meta.worktree)) {
+      rmSync(meta.worktree, { recursive: true, force: true })
+    }
+    try {
+      if (existsSync(meta.metaPath)) unlinkSync(meta.metaPath)
+    } catch {}
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 // Job type
 
 type OpencodeRunFormat = "default" | "json"
@@ -415,6 +576,12 @@ interface Job {
 
   // Reliability knobs (optional)
   timeoutSeconds?: number
+
+  // Worktree isolation (fork addition). When `worktree` is true, each run
+  // executes inside a fresh git worktree created off `worktreeBase` (default
+  // HEAD of the repo at workdir), left in place for later review/cleanup.
+  worktree?: boolean
+  worktreeBase?: string
 
   source?: string
   workdir?: string
@@ -2073,6 +2240,8 @@ function normalizeJob(raw: unknown): Job | null {
     source: typeof raw.source === "string" ? raw.source : undefined,
     workdir: typeof raw.workdir === "string" ? raw.workdir : undefined,
     timeoutSeconds: typeof raw.timeoutSeconds === "number" ? raw.timeoutSeconds : undefined,
+    worktree: raw.worktree === true ? true : undefined,
+    worktreeBase: typeof raw.worktreeBase === "string" ? raw.worktreeBase : undefined,
     createdAt: typeof raw.createdAt === "string" ? raw.createdAt : new Date().toISOString(),
     updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : undefined,
     lastRunAt: typeof raw.lastRunAt === "string" ? raw.lastRunAt : undefined,
@@ -2224,6 +2393,20 @@ function buildOpencodeArgs(job: Job): { command: string; args: string[] } {
 
   args.push("--")
   args.push(run.command ? run.arguments ?? "" : run.prompt ?? "")
+
+  // Worktree isolation (fork addition): wrap the real invocation so each run
+  // executes inside a fresh git worktree. Applies to both scheduled runs (perl
+  // supervisor execs invocation) and manual runs (runJobNow spawns invocation),
+  // since both use this builder and run from the job workdir.
+  if (job.worktree) {
+    ensureWorktreeWrapper()
+    const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
+    const base = job.worktreeBase && job.worktreeBase.trim() ? job.worktreeBase.trim() : "HEAD"
+    return {
+      command: "/bin/bash",
+      args: [WORKTREE_WRAPPER_PATH, scopeId, job.slug, base, worktreeBaseDir(scopeId), "--", command, ...args],
+    }
+  }
 
   return { command, args }
 }
@@ -2577,6 +2760,16 @@ export const SchedulerPlugin: Plugin = async () => {
               .number()
               .optional()
               .describe("Optional: max runtime in seconds (0 disables)."),
+            worktree: tool.schema
+              .boolean()
+              .optional()
+              .describe(
+                "Optional: run each execution in an isolated git worktree (created per run off worktreeBase, left in place for later review; reap with cleanup_worktrees)."
+              ),
+            worktreeBase: tool.schema
+              .string()
+              .optional()
+              .describe("Optional: git ref to base the worktree on (branch/commit). Defaults to HEAD of the repo at workdir."),
             format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
           },
 
@@ -2670,6 +2863,8 @@ export const SchedulerPlugin: Plugin = async () => {
               workdir,
               attachUrl,
               timeoutSeconds: args.timeoutSeconds,
+              worktree: args.worktree,
+              worktreeBase: args.worktreeBase,
               createdAt: new Date().toISOString(),
             }
 
@@ -2953,6 +3148,9 @@ Commands:
 
           timeoutSeconds: tool.schema.number().optional().describe("Updated timeout in seconds (0 disables)"),
 
+          worktree: tool.schema.boolean().optional().describe("Updated worktree isolation flag (true to isolate each run in a fresh git worktree)"),
+          worktreeBase: tool.schema.string().optional().describe("Updated git ref to base the worktree on (defaults to HEAD)"),
+
           workdir: tool.schema.string().optional().describe("Updated working directory"),
           attachUrl: tool.schema.string().optional().describe("Updated attach URL (set to empty to clear)"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
@@ -3052,6 +3250,14 @@ Commands:
 
           if (args.timeoutSeconds !== undefined) {
             updates.timeoutSeconds = args.timeoutSeconds
+          }
+
+          if (args.worktree !== undefined) {
+            updates.worktree = args.worktree
+          }
+
+          if (args.worktreeBase !== undefined) {
+            updates.worktreeBase = args.worktreeBase
           }
 
           if (Object.keys(updates).length === 0) {
@@ -3305,6 +3511,90 @@ Commands:
           }
 
           return okResult(format, `Logs for ${job.name}\n\n${logs}`, { job, logPath, logs })
+        },
+      }),
+
+      list_worktrees: tool({
+        description:
+          "List isolated git worktrees created by scheduled runs (fork addition). Shows branch, path, age, and whether the worktree still exists on disk.",
+        args: {
+          slug: tool.schema.string().optional().describe("Optional: only worktrees for this job slug."),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format)
+          const metas = listWorktreeMetas({ slug: args.slug })
+          if (metas.length === 0) {
+            return okResult(format, "No scheduler worktrees found.", { worktrees: [] })
+          }
+          const lines = metas.map((m) => {
+            const age = Number.isFinite(m.ageHours) ? `${m.ageHours.toFixed(1)}h` : "unknown"
+            const state = m.exists ? "" : " (missing on disk)"
+            return `- ${m.slug} [${m.branch}] age=${age}${state}\n    ${m.worktree}`
+          })
+          return okResult(format, `Scheduler worktrees (${metas.length}):\n${lines.join("\n")}`, {
+            worktrees: metas,
+          })
+        },
+      }),
+
+      cleanup_worktrees: tool({
+        description:
+          "Reap isolated scheduler worktrees older than a threshold (fork addition). Removes the worktree, prunes it from git, and (by default) deletes its scheduler branch. Dry run unless confirm=true.",
+        args: {
+          olderThanHours: tool.schema
+            .number()
+            .optional()
+            .describe(`Only reap worktrees created more than this many hours ago (default ${DEFAULT_WORKTREE_KEEP_HOURS}).`),
+          slug: tool.schema.string().optional().describe("Optional: only reap worktrees for this job slug."),
+          deleteBranch: tool.schema
+            .boolean()
+            .optional()
+            .describe("Also delete the per-run scheduler branch (default true)."),
+          confirm: tool.schema
+            .boolean()
+            .optional()
+            .describe("Set true to execute removal. Default is a dry run listing what would be removed."),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format)
+          const olderThanHours =
+            typeof args.olderThanHours === "number" && Number.isFinite(args.olderThanHours)
+              ? args.olderThanHours
+              : DEFAULT_WORKTREE_KEEP_HOURS
+          const deleteBranch = args.deleteBranch !== false
+          const dryRun = args.confirm !== true
+
+          const candidates = listWorktreeMetas({ slug: args.slug }).filter((m) => m.ageHours >= olderThanHours)
+          if (candidates.length === 0) {
+            return okResult(format, `No worktrees older than ${olderThanHours}h to reap.`, {
+              dryRun,
+              reaped: [],
+            })
+          }
+
+          const reaped: { slug: string; branch: string; worktree: string; ok: boolean; error?: string }[] = []
+          for (const m of candidates) {
+            if (dryRun) {
+              reaped.push({ slug: m.slug, branch: m.branch, worktree: m.worktree, ok: true })
+              continue
+            }
+            const result = removeWorktree(m, deleteBranch)
+            reaped.push({ slug: m.slug, branch: m.branch, worktree: m.worktree, ok: result.ok, error: result.error })
+          }
+
+          const verb = dryRun ? "Would reap" : "Reaped"
+          const lines = reaped.map((r) => {
+            const status = r.ok ? "" : ` — FAILED: ${r.error}`
+            return `- ${r.slug} [${r.branch}]${status}\n    ${r.worktree}`
+          })
+          const footer = dryRun ? "\n\nDry run — set confirm=true to remove." : ""
+          return okResult(
+            format,
+            `${verb} ${reaped.length} worktree(s) older than ${olderThanHours}h:\n${lines.join("\n")}${footer}`,
+            { dryRun, olderThanHours, deleteBranch, reaped }
+          )
         },
       }),
     },

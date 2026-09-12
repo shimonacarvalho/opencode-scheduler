@@ -10,15 +10,48 @@ This is an [OpenCode](https://opencode.ai) plugin that uses your OS's native sch
 
 As of `v1.2.0`, jobs are scoped by `workdir` (so different projects don't collide), and scheduled runs are supervised (no overlap + optional timeout).
 
+> **Fork note (`worktree` build):** This fork adds per-run **git worktree isolation** so scheduled agents never touch your working tree. See [Worktree isolation](#worktree-isolation) below.
+
 ## Install
 
-Add to your `opencode.json`:
+This fork is not published to npm — install it from a local path in your `opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-scheduler"]
+  "plugin": ["/absolute/path/to/opencode-scheduler/dist/index.js"]
 }
 ```
+
+(Upstream installs by package name: `"plugin": ["opencode-scheduler"]`.)
+
+## Worktree isolation
+
+When a job has `worktree: true`, every run (scheduled **and** manual `run_job`)
+executes inside a fresh git worktree instead of the job's `workdir`:
+
+- A worktree is created under
+  `~/.config/opencode/scheduler/worktrees/<scopeId>/<slug>__<runId>` on a new
+  branch `sched-<slug>-<runId>`, based on `worktreeBase` (default: `HEAD` of the
+  repo at `workdir`).
+- The agent runs there, so your real checkout is never modified and concurrent
+  scheduled runs never collide.
+- The worktree is **left in place** after the run for review. Cleanup is
+  deferred to the `cleanup_worktrees` tool rather than tied to run or session
+  lifetime — commit/push inside the job if you want work to survive reaping.
+
+Manage worktrees:
+
+- **`list_worktrees`** — show each worktree's branch, path, and age.
+- **`cleanup_worktrees`** — reap worktrees older than `olderThanHours` (default
+  `24`), pruning them from git and deleting the per-run branch. Dry run unless
+  `confirm: true`. Schedule it for a hands-off janitor:
+
+```
+Schedule a daily job at 4am to clean up scheduler worktrees older than 24 hours
+```
+
+New job fields: `worktree` (boolean) and `worktreeBase` (git ref) on both
+`schedule_job` and `update_job`.
 
 ## Examples
 

@@ -1,7 +1,7 @@
 {
-  "name": "opencode-scheduler",
-  "version": "1.3.0",
-  "description": "OpenCode plugin for scheduling recurring jobs using launchd, systemd, Task Scheduler, or cron fallback",
+  "name": "opencode-scheduler-worktree",
+  "version": "1.3.0-worktree.1",
+  "description": "Fork of opencode-scheduler: scheduled opencode jobs (launchd/systemd/schtasks/cron) with per-run git worktree isolation and deferred cleanup.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
